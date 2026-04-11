@@ -7,3 +7,5 @@ if [[ ! -e out ]]; then
 fi
 
 ./generate_ninja.py "$(css)" "$(css)"/out/
+
+/usr/bin/ninja -f out/build.ninja
