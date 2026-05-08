@@ -56,7 +56,7 @@ def generate_build_system(repo_root, out_dir):
     print("Changes detected. Regenerating build.ninja...")
 
     ninja_rules = [
-        "rule md_to_html\n  command = pandoc $in -o $out --self-contained\n",
+        "rule md_to_html\n  command = pandoc $in -o $out --embed-resources --standalone --resource-path=$resource_path\n",
         "rule typst_to_pdf\n  command = typst compile $in $out\n",
         "rule rst_to_html\n  command = pandoc $in -o $out\n",
     ]
@@ -87,6 +87,9 @@ def generate_build_system(repo_root, out_dir):
             abs_src = os.path.abspath(os.path.join(root, src_rel))
             esc_src = ninja_escape(abs_src)
             ext = ".html" if doc_type != "typst" else ".pdf"
+            # 3. 图片等资源在md等文件本身所在目录下
+            src_dir = os.path.dirname(abs_src)
+            esc_resource_path = ninja_escape(src_dir)
 
             # 这里的 out_rel_path 是前端 manifest 用的相对路径
             out_rel_path = f"articles/{topic_name}/{struct_path}{ext}"
@@ -106,7 +109,10 @@ def generate_build_system(repo_root, out_dir):
                 if doc_type == "md"
                 else ("typst_to_pdf" if doc_type == "typst" else "rst_to_html")
             )
-            ninja_builds.append(f"build {esc_out}: {rule} {esc_src}")
+            ninja_builds.append(
+                f"build {esc_out}: {rule} {esc_src}\n"
+                f"  resource_path = {esc_resource_path}"
+            )
 
             # 4. 递归构建 Manifest (已经确保 struct_path 不为 None)
             current = manifest[topic_name]["nodes"]
