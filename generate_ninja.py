@@ -31,6 +31,29 @@ def generate_build_system(repo_root, out_dir):
     need_update = False
     new_timestamps = {}
 
+    # ---------------------------------------------------------
+    # 🎯 1. 检查构建脚本本身的修改时间 (generate_ninja.py 与 build.sh)
+    # 使用 os.path.realpath 穿透软链接，确保获取的是 scripts/ 下真实文件的 mtime
+    # ---------------------------------------------------------
+    self_script = os.path.realpath(__file__)
+    build_sh_path = os.path.realpath(os.path.join(repo_root, "build.sh"))
+
+    scripts_to_check = [self_script]
+    if os.path.exists(build_sh_path):
+        scripts_to_check.append(build_sh_path)
+
+    for script_path in scripts_to_check:
+        current_mtime = get_file_mtime(script_path)
+        new_timestamps[script_path] = current_mtime
+        if (
+            script_path not in old_timestamps
+            or current_mtime > old_timestamps[script_path]
+        ):
+            need_update = True
+
+    # ---------------------------------------------------------
+    # 🎯 2. 遍历 repo_root 检查所有 wsw_blog.xml
+    # ---------------------------------------------------------
     for root, _, files in os.walk(repo_root):
         if "wsw_blog.xml" in files:
             xml_path = os.path.abspath(os.path.join(root, "wsw_blog.xml"))
@@ -50,13 +73,13 @@ def generate_build_system(repo_root, out_dir):
         and os.path.exists(os.path.join(out_dir, "build.ninja"))
         and os.path.exists(os.path.join(dist_dir, "manifest.json"))
     ):
-        print("No changes detected in all wsw_blog.xml file, skipping generating ninja")
+        print("No changes detected in all wsw_blog.xml file and build scripts, skipping generating ninja")
         return
 
     print("Changes detected. Regenerating build.ninja...")
 
     ninja_rules = [
-        "rule md_to_html\n  command = pandoc $in -o $out --embed-resources --standalone --resource-path=$resource_path\n",
+        "rule md_to_html\n  command = pandoc $in -o $out --embed-resources --resource-path=$resource_path\n",
         "rule typst_to_pdf\n  command = typst compile $in $out\n",
         "rule rst_to_html\n  command = pandoc $in -o $out\n",
     ]
