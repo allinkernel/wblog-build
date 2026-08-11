@@ -3,11 +3,19 @@
 import json
 import os
 import sys
-import xml.etree.ElementTree as ET
+
+EXCLUDE_DIRS = {
+    ".git",
+    ".repo",
+    "out",
+    "build",
+    "template",
+    ".cache",
+    "node_modules",
+}
 
 
 def ninja_escape(path):
-    # ninja的目标命中不能包含空格和:，所以需要用$转义
     return path.replace(":", "$:").replace(" ", "$ ")
 
 
@@ -21,62 +29,61 @@ def generate_build_system(repo_root, out_dir):
     os.makedirs(cache_dir, exist_ok=True)
 
     timestamp_file = os.path.join(cache_dir, "wsw_blogs_timestamps.json")
-    # 加载旧的时间戳
     old_timestamps = {}
     if os.path.exists(timestamp_file):
-        with open(timestamp_file, "r") as f:
-            old_timestamps = json.load(f)
+        try:
+            with open(timestamp_file, "r") as f:
+                old_timestamps = json.load(f)
+        except Exception:
+            old_timestamps = {}
 
-    all_xml_files = []
     need_update = False
     new_timestamps = {}
 
-    # ---------------------------------------------------------
-    # 🎯 1. 检查构建脚本本身的修改时间 (generate_ninja.py 与 build.sh)
-    # 使用 os.path.realpath 穿透软链接，确保获取的是 scripts/ 下真实文件的 mtime
-    # ---------------------------------------------------------
     self_script = os.path.realpath(__file__)
     build_sh_path = os.path.realpath(os.path.join(repo_root, "build.sh"))
-
-    scripts_to_check = [self_script]
-    if os.path.exists(build_sh_path):
-        scripts_to_check.append(build_sh_path)
-
-    for script_path in scripts_to_check:
-        current_mtime = get_file_mtime(script_path)
-        new_timestamps[script_path] = current_mtime
-        if (
-            script_path not in old_timestamps
-            or current_mtime > old_timestamps[script_path]
-        ):
-            need_update = True
-
-    # ---------------------------------------------------------
-    # 🎯 2. 遍历 repo_root 检查所有 wsw_blog.xml
-    # ---------------------------------------------------------
-    for root, _, files in os.walk(repo_root):
-        if "wsw_blog.xml" in files:
-            xml_path = os.path.abspath(os.path.join(root, "wsw_blog.xml"))
-            print("find ", xml_path)
-            current_mtime = get_file_mtime(xml_path)
-            new_timestamps[xml_path] = current_mtime
-            all_xml_files.append((xml_path, root))
-
-            if (
-                xml_path not in old_timestamps
-                or current_mtime > old_timestamps[xml_path]
-            ):
+    for script_path in [self_script, build_sh_path]:
+        if os.path.exists(script_path):
+            current_mtime = get_file_mtime(script_path)
+            new_timestamps[script_path] = current_mtime
+            if script_path not in old_timestamps or current_mtime > old_timestamps[script_path]:
                 need_update = True
+
+    discovered = []
+    for root, dirs, files in os.walk(repo_root):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        entry = None
+        doc_type = "md"
+        if "index.md" in files:
+            entry = "index.md"
+            doc_type = "md"
+        elif "index.typ" in files:
+            entry = "index.typ"
+            doc_type = "typst"
+        if entry:
+            abs_src = os.path.abspath(os.path.join(root, entry))
+            current_mtime = get_file_mtime(abs_src)
+            new_timestamps[abs_src] = current_mtime
+            if abs_src not in old_timestamps or current_mtime > old_timestamps[abs_src]:
+                need_update = True
+            rel_dir = os.path.relpath(root, repo_root)
+            if rel_dir == ".":
+                continue
+            parts = rel_dir.split(os.sep)
+            discovered.append((abs_src, parts, doc_type))
+
+    if len(new_timestamps) != len(old_timestamps):
+        need_update = True
 
     if (
         not need_update
         and os.path.exists(os.path.join(out_dir, "build.ninja"))
         and os.path.exists(os.path.join(dist_dir, "manifest.json"))
     ):
-        print("No changes detected in all wsw_blog.xml file and build scripts, skipping generating ninja")
+        print("No changes detected, skipping generation.")
         return
 
-    print("Changes detected. Regenerating build.ninja...")
+    print("Changes detected. Regenerating build.ninja and manifest.json...")
 
     ninja_rules = [
         "rule md_to_html\n  command = pandoc $in -o $out --embed-resources --resource-path=$resource_path\n",
@@ -84,84 +91,106 @@ def generate_build_system(repo_root, out_dir):
         "rule rst_to_html\n  command = pandoc $in -o $out\n",
     ]
     ninja_builds = []
-    manifest = {}
-
-    # 使用set实现目标去重
     generated_targets = set()
 
-    for xml_path, root in all_xml_files:
-        topic_el = ET.parse(xml_path).getroot()
-        topic_name = topic_el.get("name", "Unknown_Topic")
+    # 构建路径信息字典
+    path_info = {}
+    for abs_src, parts, doc_type in discovered:
+        path_info[tuple(parts)] = {"abs_src": abs_src, "doc_type": doc_type, "parts": parts}
 
-        if topic_name not in manifest:
-            manifest[topic_name] = {"nodes": {}}
+    # 辅助：查找最近的包含 index.md 的祖先路径（不包括自身）
+    def find_parent(parts):
+        for i in range(len(parts)-1, 0, -1):
+            candidate = parts[:i]
+            if candidate in path_info:
+                return candidate
+        return None
 
-        for blog in topic_el.findall("blog"):
-            # 1. 使用 get 并提供默认值，消除 None 报错
-            struct_path = blog.get("target", "")
-            src_rel = blog.get("file", "")
-            doc_type = blog.get("type", "md")
+    # 获取顶级主题（没有父主题的路径）
+    top_paths = []
+    for parts in path_info.keys():
+        if find_parent(parts) is None:
+            top_paths.append(parts)
 
-            # 如果关键属性缺失，跳过
-            if not struct_path or not src_rel:
-                continue
+    # 创建节点对象
+    node_map = {}
+    for parts in path_info.keys():
+        info = path_info[parts]
+        node = {"file": None, "type": info["doc_type"], "children": {}}
+        node_map[parts] = node
 
-            # 2. 路径计算 (显式转为绝对路径)
-            abs_src = os.path.abspath(os.path.join(root, src_rel))
-            esc_src = ninja_escape(abs_src)
-            ext = ".html" if doc_type != "typst" else ".pdf"
-            # 3. 图片等资源在md等文件本身所在目录下
-            src_dir = os.path.dirname(abs_src)
-            esc_resource_path = ninja_escape(src_dir)
+    # 计算输出路径
+    def get_top(parts):
+        parent = find_parent(parts)
+        if parent is None:
+            return parts
+        else:
+            return get_top(parent)
 
-            # 这里的 out_rel_path 是前端 manifest 用的相对路径
-            out_rel_path = f"articles/{topic_name}/{struct_path}{ext}"
-            # 这里的 abs_out 是 Ninja 编译用的物理路径
-            abs_out = os.path.abspath(os.path.join(dist_dir, out_rel_path))
-            if abs_out in generated_targets:
-                print(f"Warning: Duplicate target skipped: {out_rel_path}")
-                continue
-            generated_targets.add(abs_out)
-            esc_out = ninja_escape(abs_out)
+    for parts, info in path_info.items():
+        top_parts = get_top(parts)
+        top_name = top_parts[-1]
+        sub_parts = parts[len(top_parts):]
+        ext = ".html" if info["doc_type"] != "typst" else ".pdf"
+        if sub_parts:
+            sub_path = "/".join(sub_parts)
+            out_rel_path = f"articles/{top_name}/{sub_path}/index{ext}"
+        else:
+            out_rel_path = f"articles/{top_name}/index{ext}"
+        node_map[parts]["file"] = out_rel_path
+        # 存储输出路径便于构建 ninja
+        info["out_rel_path"] = out_rel_path
+        info["abs_out"] = os.path.abspath(os.path.join(dist_dir, out_rel_path))
 
-            os.makedirs(os.path.dirname(abs_out), exist_ok=True)
+    # 建立父子关系：将子节点添加到父节点的 children 中
+    for parts in path_info.keys():
+        parent_parts = find_parent(parts)
+        if parent_parts is not None:
+            parent_node = node_map[parent_parts]
+            child_name = parts[-1]
+            parent_node["children"][child_name] = node_map[parts]
 
-            # 3. Ninja 指令
-            rule = (
-                "md_to_html"
-                if doc_type == "md"
-                else ("typst_to_pdf" if doc_type == "typst" else "rst_to_html")
-            )
-            ninja_builds.append(
-                f"build {esc_out}: {rule} {esc_src}\n"
-                f"  resource_path = {esc_resource_path}"
-            )
+    # 构建 manifest
+    manifest = {}
+    for parts in top_paths:
+        top_name = parts[-1]
+        node = node_map[parts]
+        manifest[top_name] = {
+            "file": node["file"],
+            "type": node["type"],
+            "nodes": node["children"]  # 将直接子节点放入 nodes
+        }
 
-            # 4. 递归构建 Manifest (已经确保 struct_path 不为 None)
-            current = manifest[topic_name]["nodes"]
-            parts = struct_path.split("/")
-            for i, part in enumerate(parts):
-                if part not in current:
-                    current[part] = {"children": {}, "file": None, "type": None}
-                if i == len(parts) - 1:  # 叶子节点
-                    current[part]["file"] = out_rel_path
-                    current[part]["type"] = doc_type
-                current = current[part]["children"]
+    # 生成 ninja 构建规则
+    for parts, info in path_info.items():
+        abs_out = info["abs_out"]
+        if abs_out in generated_targets:
+            print(f"Warning: Duplicate target {info['out_rel_path']} skipped.")
+            continue
+        generated_targets.add(abs_out)
+        esc_src = ninja_escape(info["abs_src"])
+        esc_out = ninja_escape(abs_out)
+        src_dir = os.path.dirname(info["abs_src"])
+        esc_resource_path = ninja_escape(src_dir)
+        os.makedirs(os.path.dirname(abs_out), exist_ok=True)
+        rule = "md_to_html" if info["doc_type"] == "md" else ("typst_to_pdf" if info["doc_type"] == "typst" else "rst_to_html")
+        ninja_builds.append(
+            f"build {esc_out}: {rule} {esc_src}\n"
+            f"  resource_path = {esc_resource_path}"
+        )
 
-    # 写入 build.ninja 和 manifest.json
     with open(os.path.join(out_dir, "build.ninja"), "w") as f:
         f.write("\n".join(ninja_rules + ninja_builds))
         f.write("\n")
 
     with open(os.path.join(dist_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=4)
+        json.dump(manifest, f, indent=4, ensure_ascii=False)
 
-    # 保存新的时间戳
     with open(timestamp_file, "w") as f:
         json.dump(new_timestamps, f)
 
 
 if __name__ == "__main__":
-    repo = sys.argv[1] if len(sys.argv) > 1 else "./.repo"
+    repo = sys.argv[1] if len(sys.argv) > 1 else "."
     out = sys.argv[2] if len(sys.argv) > 2 else "./out"
     generate_build_system(repo, out)

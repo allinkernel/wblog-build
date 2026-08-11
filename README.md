@@ -1,2 +1,9 @@
 # wblog-build
-这里是构建仓，通过执行build.sh可以编译md文件
+## 编译方法
+```bash
+zsh ./build.sh
+```
+
+## `wsw_blog.xml`的作用
+
+
