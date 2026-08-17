@@ -1,0 +1,17 @@
+# lychee.toml
+
+# 最大并发连接数
+max_concurrency = 16
+
+# 检查重定向
+
+# 需要排除的 URL 正则列表
+exclude = [
+  'http://127\.0\.0\.1.*',
+  'https://localhost.*',
+  '^https://(www\.)?gitee\.com/.*'  # gitee.com的东西不排查
+]
+
+
+# 超时设置（秒）
+timeout = 10
