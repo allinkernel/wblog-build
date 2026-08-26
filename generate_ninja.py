@@ -89,10 +89,29 @@ def generate_build_system(repo_root, out_dir):
     build_sh_path = os.path.realpath(os.path.join(repo_root, "build.sh"))
     src_tool = os.path.realpath(os.path.join(repo_root, "build", "scripts", "html_2_html.py"))
     host_tool = os.path.join(out_dir, HOST_TOOL_REL)
+    # Pagefind 全文搜索：静态二进制以 xz 压缩入库（节省 git 体积），安装时解压；索引脚本同策略装到 out/host/
+    src_pagefind_xz = os.path.realpath(os.path.join(repo_root, "build", "scripts", "pagefind.xz"))
+    src_pagefind_idx = os.path.realpath(os.path.join(repo_root, "build", "scripts", "pagefind_index.py"))
+    host_pagefind = os.path.join(out_dir, "host", "pagefind")
+    host_pagefind_idx = os.path.join(out_dir, "host", "pagefind_index.py")
     # 安装宿主工具：html_2_html.py → out/host/（copy2 保留 mtime，避免无谓全量重建）
     os.makedirs(os.path.dirname(host_tool), exist_ok=True)
     shutil.copy2(src_tool, host_tool)
-    for script_path in [self_script, build_sh_path, src_tool]:
+    if os.path.exists(src_pagefind_xz):
+        # 解压 pagefind.xz → out/host/pagefind；产物 mtime 对齐源 xz，ninja 增量判断稳定
+        if not (os.path.exists(host_pagefind)
+                and os.path.getmtime(host_pagefind) >= os.path.getmtime(src_pagefind_xz)):
+            import lzma
+            print("Installing pagefind from pagefind.xz ...")
+            xz_mtime = os.path.getmtime(src_pagefind_xz)
+            with lzma.open(src_pagefind_xz, "rb") as fin, open(host_pagefind, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            os.chmod(host_pagefind, 0o755)
+            os.utime(host_pagefind, (xz_mtime, xz_mtime))
+    if os.path.exists(src_pagefind_idx):
+        shutil.copy2(src_pagefind_idx, host_pagefind_idx)
+
+    for script_path in [self_script, build_sh_path, src_tool, src_pagefind_idx, src_pagefind_xz]:
         if os.path.exists(script_path):
             current_mtime = get_file_mtime(script_path)
             new_timestamps[script_path] = current_mtime
@@ -144,6 +163,12 @@ def generate_build_system(repo_root, out_dir):
         "rule html_to_html\n  command = python3 %s $in $out\n" % ninja_escape(host_tool),
         "rule typst_to_pdf\n  command = typst compile $in $out\n",
         "rule rst_to_html\n  command = pandoc $in -o $out\n",
+        "rule pagefind_index\n  command = python3 %s --pagefind %s --site %s --output %s\n" % (
+            ninja_escape(os.path.abspath(host_pagefind_idx)),
+            ninja_escape(os.path.abspath(host_pagefind)),
+            ninja_escape(os.path.abspath(dist_dir)),
+            ninja_escape(os.path.abspath(os.path.join(dist_dir, "pagefind"))),
+        ),
     ]
     ninja_builds = []
     generated_targets = set()
@@ -245,6 +270,22 @@ def generate_build_system(repo_root, out_dir):
                 f"build {esc_out}: {rule} {esc_src}\n"
                 f"  resource_path = {esc_resource_path}"
             )
+
+    # Pagefind 全文索引聚合目标：隐式依赖所有 html/md/rst 产物 + pagefind 工具，
+    # 任一文章或工具变化都触发重建（pagefind_index rule 内部全量重建，ninja 负责判断时机）
+    if os.path.exists(host_pagefind) and os.path.exists(host_pagefind_idx):
+        html_outputs = sorted(
+            ninja_escape(info["abs_out"])
+            for info in path_info.values()
+            if info["doc_type"] in ("md", "html", "rst")
+        )
+        if html_outputs:
+            pf_js = ninja_escape(os.path.abspath(os.path.join(dist_dir, "pagefind", "pagefind.js")))
+            deps = " ".join(html_outputs + [
+                ninja_escape(os.path.abspath(host_pagefind)),
+                ninja_escape(os.path.abspath(host_pagefind_idx)),
+            ])
+            ninja_builds.append(f"build {pf_js}: pagefind_index | {deps}\n")
 
     with open(os.path.join(out_dir, "build.ninja"), "w") as f:
         f.write("\n".join(ninja_rules + ninja_builds))
