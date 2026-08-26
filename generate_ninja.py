@@ -12,7 +12,22 @@ EXCLUDE_DIRS = {
     "template",
     ".cache",
     "node_modules",
+    # AI 工具/代理的工作目录（Codewhale、Gemini CLI 等），不应参与文章扫描。
+    ".codewhale",
+    ".codewhale-worktrees",
+    ".gemini",
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".aider",
 }
+
+
+def is_excluded_dir(name):
+    # 兜底规则：任何以 "." 开头的隐藏目录一律不扫描。
+    # 博客主题目录名会成为 URL 路径（articles/<top_name>/...），不可能以 "." 开头，
+    # 因此该规则可自动覆盖未来新增的 AI 工具目录，无需每次改动名单。
+    return name.startswith(".") or name in EXCLUDE_DIRS
 
 
 def ninja_escape(path):
@@ -51,7 +66,7 @@ def generate_build_system(repo_root, out_dir):
 
     discovered = []
     for root, dirs, files in os.walk(repo_root):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        dirs[:] = [d for d in dirs if not is_excluded_dir(d)]
         entry = None
         doc_type = "md"
         if "index.md" in files:

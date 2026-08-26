@@ -1,1 +1,2 @@
-git push origin HEAD:main
+git push ssh://git@github.com/allinkernel/wblog-build.git HEAD:main
+
