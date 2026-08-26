@@ -2,6 +2,8 @@
 
 import json
 import os
+import re
+import shutil
 import sys
 
 EXCLUDE_DIRS = {
@@ -34,6 +36,34 @@ def ninja_escape(path):
     return path.replace(":", "$:").replace(" ", "$ ")
 
 
+# 宿主工具（AOSP 风格：构建工具安装到 out/host/，ninja rule 通过它执行）
+HOST_TOOL_REL = os.path.join("host", "html_2_html.py")
+
+
+def doc_type_rule(doc_type):
+    # index.html 直接由 html_2_html.py 裁剪；其余走 pandoc/typst
+    return {
+        "md": "md_to_html",
+        "html": "html_to_html",
+        "typst": "typst_to_pdf",
+    }.get(doc_type, "rst_to_html")
+
+
+def node_sort_key(name):
+    """文章目录名排序键（manifest 各层统一按此排序）。
+
+    规则：目录名开头的点分数字序号（如 2.10、2.10.3）先按自然序比较
+    （2.9 < 2.10），剩余部分再按字母序（ai-guide < translation）；
+    无序号目录排在带序号之后，整体按字母序。
+    """
+    m = re.match(r"^(\d+(?:\.\d+)*)", name)
+    if m:
+        nums = tuple(int(x) for x in m.group(1).split("."))
+        rest = re.sub(r"^[^a-z0-9]+", "", name[m.end():].lower())
+        return (0, nums, rest)
+    return (1, (), name.lower())
+
+
 def get_file_mtime(path):
     return os.path.getmtime(path)
 
@@ -57,7 +87,12 @@ def generate_build_system(repo_root, out_dir):
 
     self_script = os.path.realpath(__file__)
     build_sh_path = os.path.realpath(os.path.join(repo_root, "build.sh"))
-    for script_path in [self_script, build_sh_path]:
+    src_tool = os.path.realpath(os.path.join(repo_root, "build", "scripts", "html_2_html.py"))
+    host_tool = os.path.join(out_dir, HOST_TOOL_REL)
+    # 安装宿主工具：html_2_html.py → out/host/（copy2 保留 mtime，避免无谓全量重建）
+    os.makedirs(os.path.dirname(host_tool), exist_ok=True)
+    shutil.copy2(src_tool, host_tool)
+    for script_path in [self_script, build_sh_path, src_tool]:
         if os.path.exists(script_path):
             current_mtime = get_file_mtime(script_path)
             new_timestamps[script_path] = current_mtime
@@ -68,8 +103,12 @@ def generate_build_system(repo_root, out_dir):
     for root, dirs, files in os.walk(repo_root):
         dirs[:] = [d for d in dirs if not is_excluded_dir(d)]
         entry = None
-        doc_type = "md"
-        if "index.md" in files:
+        doc_type = None
+        # index.html 优先：html 直接编译比 md 剥离快，同目录下存在 index.html 时忽略 index.md
+        if "index.html" in files:
+            entry = "index.html"
+            doc_type = "html"
+        elif "index.md" in files:
             entry = "index.md"
             doc_type = "md"
         elif "index.typ" in files:
@@ -102,6 +141,7 @@ def generate_build_system(repo_root, out_dir):
 
     ninja_rules = [
         "rule md_to_html\n  command = pandoc $in -o $out --embed-resources --resource-path=$resource_path\n",
+        "rule html_to_html\n  command = python3 %s $in $out\n" % ninja_escape(host_tool),
         "rule typst_to_pdf\n  command = typst compile $in $out\n",
         "rule rst_to_html\n  command = pandoc $in -o $out\n",
     ]
@@ -113,7 +153,7 @@ def generate_build_system(repo_root, out_dir):
     for abs_src, parts, doc_type in discovered:
         path_info[tuple(parts)] = {"abs_src": abs_src, "doc_type": doc_type, "parts": parts}
 
-    # 辅助：查找最近的包含 index.md 的祖先路径（不包括自身）
+    # 辅助：查找最近的包含 index.* 文章的祖先路径（不包括自身）
     def find_parent(parts):
         for i in range(len(parts)-1, 0, -1):
             candidate = parts[:i]
@@ -165,9 +205,13 @@ def generate_build_system(repo_root, out_dir):
             child_name = parts[-1]
             parent_node["children"][child_name] = node_map[parts]
 
-    # 构建 manifest
+    # 各层子节点统一排序：带序号目录先按序号自然序、再按字母序；无序号目录排后按字母序
+    for node in node_map.values():
+        node["children"] = dict(sorted(node["children"].items(), key=lambda kv: node_sort_key(kv[0])))
+
+    # 构建 manifest（顶层主题同样按排序规则）
     manifest = {}
-    for parts in top_paths:
+    for parts in sorted(top_paths, key=lambda p: node_sort_key(p[-1])):
         top_name = parts[-1]
         node = node_map[parts]
         manifest[top_name] = {
@@ -177,6 +221,7 @@ def generate_build_system(repo_root, out_dir):
         }
 
     # 生成 ninja 构建规则
+    esc_host_tool = ninja_escape(os.path.abspath(host_tool))
     for parts, info in path_info.items():
         abs_out = info["abs_out"]
         if abs_out in generated_targets:
@@ -188,11 +233,18 @@ def generate_build_system(repo_root, out_dir):
         src_dir = os.path.dirname(info["abs_src"])
         esc_resource_path = ninja_escape(src_dir)
         os.makedirs(os.path.dirname(abs_out), exist_ok=True)
-        rule = "md_to_html" if info["doc_type"] == "md" else ("typst_to_pdf" if info["doc_type"] == "typst" else "rst_to_html")
-        ninja_builds.append(
-            f"build {esc_out}: {rule} {esc_src}\n"
-            f"  resource_path = {esc_resource_path}"
-        )
+        rule = doc_type_rule(info["doc_type"])
+        if info["doc_type"] == "html":
+            # html->html：图片在 html_2_html.py 内内联，无需 resource_path；
+            # 把宿主工具作为隐式依赖（| 后），工具更新时 ninja 自动重建全部 html 产物
+            ninja_builds.append(
+                f"build {esc_out}: html_to_html {esc_src} | {esc_host_tool}\n"
+            )
+        else:
+            ninja_builds.append(
+                f"build {esc_out}: {rule} {esc_src}\n"
+                f"  resource_path = {esc_resource_path}"
+            )
 
     with open(os.path.join(out_dir, "build.ninja"), "w") as f:
         f.write("\n".join(ninja_rules + ninja_builds))
