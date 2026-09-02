@@ -26,7 +26,7 @@ import sys
 
 SCHEMA_VERSION = "1"
 
-TITLE_RE = re.compile(r"(?is)<h[1][^>]*>(.*?)</h\1>")
+TITLE_RE = re.compile(r"(?is)<h1[^>]*>(.*?)</h1>")
 STRIP_RE = re.compile(r"(?is)<(script|style|head|nav)[^>]*>.*?</\1>")
 BR_RE = re.compile(r"(?is)<br\s*/?>")
 BLOCK_RE = re.compile(r"(?is)</(p|h[1-6]|div|li|tr|th|td|blockquote|pre|section|article)>")
@@ -144,6 +144,9 @@ def render_sql(pages, dist_dir, manifest_sha):
         except OSError:
             continue
         title = extract_title(frag)
+        if title == "未命名文章":
+            # 无 h1 的页（POSIX mansec 排版/空文件）：用文章目录名作标题
+            title = os.path.basename(os.path.dirname(html_path)) or "未命名文章"
         body = html_to_text(frag)
         url = "/" + p["file_path"]
         data.append("INSERT INTO pages (url, file_path, title, kind) VALUES (%s, %s, %s, %s);"
