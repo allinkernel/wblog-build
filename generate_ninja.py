@@ -119,6 +119,7 @@ def generate_build_system(repo_root, out_dir):
                 need_update = True
 
     discovered = []
+    private_parts = set()   # 源路径含 private_file 的文章（私密：输出不进公开 out/dist）
     for root, dirs, files in os.walk(repo_root):
         dirs[:] = [d for d in dirs if not is_excluded_dir(d)]
         entry = None
@@ -143,6 +144,14 @@ def generate_build_system(repo_root, out_dir):
             if rel_dir == ".":
                 continue
             parts = rel_dir.split(os.sep)
+            # private_file 标记：该目录文章为私密（正文不进公开 out/dist；密码见各仓库 .private-pass）
+            pf_path = os.path.join(root, "private_file")
+            if os.path.exists(pf_path):
+                private_parts.add(tuple(parts))
+                pf_mtime = get_file_mtime(pf_path)
+                new_timestamps[pf_path] = pf_mtime
+                if pf_path not in old_timestamps or pf_mtime > old_timestamps.get(pf_path, 0):
+                    need_update = True
             discovered.append((abs_src, parts, doc_type))
 
     if len(new_timestamps) != len(old_timestamps):
@@ -218,9 +227,14 @@ def generate_build_system(repo_root, out_dir):
         else:
             out_rel_path = f"articles/{top_name}/index{ext}"
         node_map[parts]["file"] = out_rel_path
-        # 存储输出路径便于构建 ninja
+        # 存储输出路径便于构建 ninja（私密输出到 out/private-articles，不进公开 out/dist）
         info["out_rel_path"] = out_rel_path
-        info["abs_out"] = os.path.abspath(os.path.join(dist_dir, out_rel_path))
+        if tuple(parts) in private_parts:
+            node_map[parts]["private"] = True
+            info["private"] = True
+            info["abs_out"] = os.path.abspath(os.path.join(out_dir, "private-articles", out_rel_path))
+        else:
+            info["abs_out"] = os.path.abspath(os.path.join(dist_dir, out_rel_path))
 
     # 建立父子关系：将子节点添加到父节点的 children 中
     for parts in path_info.keys():
@@ -293,6 +307,15 @@ def generate_build_system(repo_root, out_dir):
 
     with open(os.path.join(dist_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=4, ensure_ascii=False)
+
+    # 私密文章清单：file(articles/...) → 源仓库名（供 db_gen 归属密码/正文）
+    private_index = {}
+    for parts in private_parts:
+        info = path_info.get(parts)
+        if info:
+            private_index[info["out_rel_path"]] = parts[0]
+    with open(os.path.join(out_dir, "private.json"), "w") as f:
+        json.dump(private_index, f, indent=2, ensure_ascii=False)
 
     with open(timestamp_file, "w") as f:
         json.dump(new_timestamps, f)

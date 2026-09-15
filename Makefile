@@ -12,9 +12,12 @@
 all: build
 
 build:
-	./build.sh
+	python3 build/generate_ninja.py . ./out/
+	ninja -f out/build.ninja
+	rm -rf out/dist/template && ln -snf ../../template out/dist/template
 	python3 build/scripts/db_gen.py --dist out/dist --manifest out/dist/manifest.json \
-		--out-sql out/sql --out-db out/index.db
+		--out-sql out/sql --out-db out/index.db \
+		--private-dir out/private-articles --private-index out/private.json --repo-root .
 	bash build/scripts/gen_image.sh
 	bash build/scripts/verify_image.sh
 
